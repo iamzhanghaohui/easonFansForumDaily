@@ -185,8 +185,102 @@ def click_element(driver, element):
         driver.execute_script("arguments[0].click();", element)
 
 def question(driver):
-    from quiz_scheduler import run_quiz
-    return run_quiz(driver).correct_rate
+    base_url = "https://www.easonfans.com/forum/plugin.php?id=ahome_dayquestion:index"
+    global _api_call_count
+    _api_call_count = 0
+    MAX_API_CALLS = 12
+    MAX_QUESTION_RETRIES = 3
+
+    driver.get(base_url)
+    try:
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.ID, "inner"))
+        )
+    except Exception as e:
+        print(f"页面加载失败: {e}")
+
+    try:
+        page_source = driver.page_source
+        total_answered_match = re.search(r"累计答题:\s*(\d+)", page_source)
+        total_correct_match = re.search(r"累计答对:\s*(\d+)", page_source)
+        initial_answer = int(total_answered_match.group(1)) if total_answered_match else 0
+        initial_correct = int(total_correct_match.group(1)) if total_correct_match else 0
+    except Exception as e:
+        print(f"无法提取初始答题信息: {e}")
+        initial_answer = 0
+        initial_correct = 0
+
+    correct_rate = None
+    previous_participated = -1
+    question_retry_count = 0
+    while True:
+        driver.get(base_url)
+        try:
+            participated_element = WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.ID, "inner"))
+            )
+        except Exception as e:
+            print(f"页面加载失败: {e}")
+            break
+
+        matches = re.search(r"\((\d+)/(\d+)\)", participated_element.text)
+        if not matches:
+            print("无法读取今日答题进度。")
+            break
+        participated, total = map(int, matches.groups())
+
+        if previous_participated >= 0 and participated == previous_participated + 1:
+            _api_call_count = 0
+            question_retry_count = 0
+        previous_participated = participated
+
+        if participated >= total:
+            try:
+                page_source = driver.page_source
+                total_answered_match = re.search(r"累计答题:\s*(\d+)", page_source)
+                total_correct_match = re.search(r"累计答对:\s*(\d+)", page_source)
+                final_answer = int(total_answered_match.group(1)) if total_answered_match else 0
+                final_correct = int(total_correct_match.group(1)) if total_correct_match else 0
+            except Exception as e:
+                print(f"无法提取最终答题信息: {e}")
+                final_answer = initial_answer
+                final_correct = initial_correct
+
+            if final_answer > initial_answer:
+                correct_rate = (final_correct - initial_correct) / (final_answer - initial_answer)
+                print(f"今日答题已完成，答题正确率 {correct_rate * 100:.2f}%。总正确数/答题数：{final_correct}/{final_answer}。")
+            else:
+                print(f"今日答题已完成。总正确数/答题数：{final_correct}/{final_answer}。")
+            break
+
+        if _api_call_count >= MAX_API_CALLS:
+            print(f"单次运行 API 调用已达 {MAX_API_CALLS} 次，跳过后续答题")
+            correct_rate = quiz_correct_rate(driver, initial_answer, initial_correct)
+            break
+
+        if question_retry_count >= MAX_QUESTION_RETRIES:
+            print(f"第 {participated + 1} 题已重试 {MAX_QUESTION_RETRIES} 次仍失败，跳过后续答题")
+            correct_rate = quiz_correct_rate(driver, initial_answer, initial_correct)
+            break
+
+        try:
+            WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.XPATH, "//button[@name='submit'][@value='true']"))
+            )
+            use_api = question_retry_count == 0
+            answer_question(
+                driver,
+                participated,
+                fallback_index=question_retry_count,
+                use_api=use_api,
+            )
+        except Exception as e:
+            question_retry_count += 1
+            print(f"答题第 {participated + 1} 题失败（第 {question_retry_count}/{MAX_QUESTION_RETRIES} 次）: {type(e).__name__}: {e}")
+            sleep(3)
+            continue
+
+    return correct_rate
 
 def quiz_correct_rate(driver, initial_answer, initial_correct):
     """根据本次运行前后的累计答题数计算正确率，无法计算时返回 None。"""
@@ -416,18 +510,9 @@ def enrich_prompt_with_search(prompt):
     return prompt + extra
 
 def get_answer_from_api(prompt):
-    """优先走检索 Agent；失败时回退到单次搜索+作答。"""
+    """单次调用 API，成功返回 a1-a4，失败返回 None。"""
     global _api_call_count
     _api_call_count += 1
-
-    try:
-        from quiz_agent import answer_quiz
-        label = answer_quiz(prompt)
-        if label:
-            return label
-        print("Agent 未给出有效答案，回退到单次检索作答。")
-    except Exception as e:
-        print(f"Agent 调用失败，回退到单次检索作答（{type(e).__name__}）: {e}")
 
     client = OpenAI(api_key=api_key, base_url=llm_base_url)
     valid_options = ['a1', 'a2', 'a3', 'a4']
@@ -591,7 +676,6 @@ def merge(headless: bool, local: bool, chromedriver_path: str):
     else:
         print(f"=== Script for {username} started at {now_str} remotely===")
 
-    print("=== 1. 自动登录 ===")
     login_success = False
     while not login_success:
         login_success = login(driver)
@@ -601,20 +685,14 @@ def merge(headless: bool, local: bool, chromedriver_path: str):
             print("重新尝试登录...")
             sleep(5)
     initial_money = getMoney(driver)
-    print("=== 2. 签到 ===")
     signin(driver)
-    print("=== 3. 答题调度 ===")
-    from quiz_scheduler import format_quiz_summary, run_quiz
-    quiz_result = run_quiz(driver)
-    print("=== 4. 抽奖 ===")
+    print("本脚本跳过答题，仅处理签到与抽奖。")
+    correct_rate = None
     lottery(driver)
     final_money = getMoney(driver)
     print(f"金钱变化：{initial_money} -> {final_money}。")
-    print("=== 5. 总结报告 ===")
-    summary = format_quiz_summary(quiz_result)
-    print(summary)
     driver.quit()
-    return initial_money, final_money, quiz_result
+    return initial_money, final_money, correct_rate
 
 def main():
     global username, password, mail_user, mail_pass, api_key, search_api_key
@@ -627,7 +705,6 @@ def main():
     args = parser.parse_args()
     # args.local = True
     # 配置加载
-    config = None
     try:
         if args.local:
             base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -703,33 +780,15 @@ def main():
     except KeyError as e:
         raise Exception(f"Missing required configuration: {e}")
 
-    from quiz_agent import AgentSettings, configure as configure_quiz_agent
-    configure_quiz_agent(AgentSettings.from_mapping(config if args.local else None))
-
     # merge(headless=args.headless, local=args.local, chromedriver_path=chromedriver_path)
     merge_fn = partial(merge, headless=args.headless, local=args.local, chromedriver_path=chromedriver_path)
     # local 模式下 tee=True：print 实时显示在控制台，同时写入缓冲区用于发邮件
-    output_message, (initial_money, final_money, quiz_result) = capture_output(merge_fn, tee=args.local)
-    from quiz_scheduler import format_quiz_summary
-    summary = format_quiz_summary(quiz_result)
-    report = (
-        "每日任务总结报告\n"
-        f"金钱：{initial_money} -> {final_money}\n"
-        f"{summary}\n\n"
-        "======== 详细日志 ========\n"
-        f"{output_message}"
-    )
-    if quiz_result.correct_rate is not None:
-        subject = (
-            f"{initial_money} -> {final_money} | "
-            f"答题 {quiz_result.correct_count}/{quiz_result.attempted} "
-            f"正确率 {quiz_result.correct_rate * 100:.2f}%"
-        )
-    elif quiz_result.already_done:
-        subject = f"{initial_money} -> {final_money} | 今日答题已完成"
+    output_message, (initial_money, final_money, correct_rate) = capture_output(merge_fn, tee=args.local)
+    if correct_rate is not None:
+        subject = f"{initial_money} -> {final_money} | 正确率 {correct_rate * 100:.2f}%"
     else:
         subject = f"{initial_money} -> {final_money}"
-    sendEmail(report, subject=subject)
+    sendEmail(output_message, subject=subject)
 
 if __name__ == '__main__':
     main()

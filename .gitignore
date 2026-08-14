@@ -1,3 +1,9 @@
 config.json
 /chromedriver-win64
 /chromedriver-linux64
+data/
+cron.log
+__pycache__/
+.venv/
+.fit/
+*.pyc

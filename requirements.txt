@@ -3,3 +3,5 @@ pytesseract
 beautifulsoup4
 dashscope
 openai
+openai-agents
+tencentcloud-sdk-python-wsa
