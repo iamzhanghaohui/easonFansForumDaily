@@ -729,6 +729,8 @@ def main():
         subject = f"{initial_money} -> {final_money} | 今日答题已完成"
     else:
         subject = f"{initial_money} -> {final_money}"
+    if quiz_result.skip_reason:
+        subject += " | 有题目跳过，请重试"
     sendEmail(report, subject=subject)
 
 if __name__ == '__main__':

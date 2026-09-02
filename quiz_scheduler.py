@@ -26,6 +26,7 @@ class QuizItemResult:
     reason: str = ""
     correct: Optional[bool] = None
     ok: bool = False
+    skipped: bool = False
 
 
 @dataclass
@@ -34,6 +35,7 @@ class QuizRunResult:
     already_done: bool = False
     participated: int = 0
     total: int = 3
+    skip_reason: str = ""
 
     @property
     def attempted(self) -> int:
@@ -90,6 +92,16 @@ def _ask_agent(prompt: str, hint) -> tuple[Optional[str], str]:
     return label, extra
 
 
+def _mark_skip(result: QuizRunResult, reason: str, item: Optional[QuizItemResult] = None) -> None:
+    result.skip_reason = reason
+    if item is not None:
+        item.skipped = True
+        item.ok = False
+        if reason and reason not in (item.reason or ""):
+            item.reason = f"{item.reason}；{reason}" if item.reason else reason
+    print(f"跳过后续答题：{reason}")
+
+
 def run_quiz(driver) -> QuizRunResult:
     """取题/进度完全沿用 dailyMission.question 的原流程，中间插入 Agent 与本地提交。"""
     from dailyMission import build_prompt
@@ -104,7 +116,9 @@ def run_quiz(driver) -> QuizRunResult:
             EC.presence_of_element_located((By.ID, "inner"))
         )
     except Exception as e:
-        print(f"页面加载失败: {e}")
+        _mark_skip(result, f"答题页加载失败，已跳过，请稍后手动重试（{type(e).__name__}: {e}）")
+        print("\n=== 今日答题小结 ===")
+        print(format_quiz_summary(result, bank))
         print("=== 答题调度结束 ===")
         return result
 
@@ -119,12 +133,16 @@ def run_quiz(driver) -> QuizRunResult:
                 EC.presence_of_element_located((By.ID, "inner"))
             )
         except Exception as e:
-            print(f"页面加载失败: {e}")
+            _mark_skip(
+                result,
+                f"答题页加载失败，已跳过，请稍后手动重试（{type(e).__name__}: {e}）",
+                pending_item,
+            )
             break
 
         matches = re.search(r"\((\d+)/(\d+)\)", participated_element.text)
         if not matches:
-            print("无法读取今日答题进度。")
+            _mark_skip(result, "无法读取今日答题进度，已跳过，请稍后手动重试", pending_item)
             break
         participated, total = map(int, matches.groups())
         result.participated = participated
@@ -148,6 +166,15 @@ def run_quiz(driver) -> QuizRunResult:
             )
             mark = "对" if pending_item.correct else ("错" if pending_item.correct is False else "未知")
             print(f"已写入题库：第 {pending_item.index} 题 [{mark}] {pending_item.label} {pending_item.choice_text}")
+            if not answered:
+                _mark_skip(
+                    result,
+                    f"第 {pending_item.index} 题提交失败（页面未更新），已跳过，请稍后手动重试",
+                    pending_item,
+                )
+                pending_item = None
+                pending_before = None
+                break
             pending_item = None
             pending_before = None
 
@@ -161,17 +188,54 @@ def run_quiz(driver) -> QuizRunResult:
                 print(f"今日答题已完成。总正确数/答题数：{current_correct}/{current_answer}。")
             break
 
+        index = participated + 1
+        if any(item.index == index for item in result.items):
+            _mark_skip(result, f"第 {index} 题已尝试过，不再重复提交，请稍后手动重试")
+            break
+
         try:
             WebDriverWait(driver, 10).until(
                 EC.element_to_be_clickable((By.XPATH, "//button[@name='submit'][@value='true']"))
             )
         except Exception as e:
-            print(f"提交按钮不可用: {e}")
+            _mark_skip(
+                result,
+                f"第 {index} 题加载失败（提交按钮不可用），已跳过，请稍后手动重试（{type(e).__name__}: {e}）",
+            )
+            result.items.append(
+                QuizItemResult(
+                    index=index,
+                    question="",
+                    options={},
+                    label=None,
+                    skipped=True,
+                    reason=result.skip_reason,
+                )
+            )
             break
 
-        prompt = build_prompt(driver)
-        question_text, options = _fields_from_prompt(prompt)
-        index = participated + 1
+        try:
+            prompt = build_prompt(driver)
+            question_text, options = _fields_from_prompt(prompt)
+            if not question_text or not options:
+                raise ValueError("题目或选项为空")
+        except Exception as e:
+            _mark_skip(
+                result,
+                f"第 {index} 题加载失败，已跳过，请稍后手动重试（{type(e).__name__}: {e}）",
+            )
+            result.items.append(
+                QuizItemResult(
+                    index=index,
+                    question="",
+                    options={},
+                    label=None,
+                    skipped=True,
+                    reason=result.skip_reason,
+                )
+            )
+            break
+
         print(f"\n--- 调度第 {index}/{total} 题 ---")
         print("1. 已获取题目，告诉 Agent：")
         print(prompt)
@@ -214,7 +278,11 @@ def run_quiz(driver) -> QuizRunResult:
         result.items.append(item)
         if not ok:
             bank.record(question_text, options, label, None, source, reason)
-            print("提交未成功，停止后续调度，避免重复提交。")
+            _mark_skip(
+                result,
+                f"第 {index} 题提交失败，已跳过，请稍后手动重试",
+                item,
+            )
             break
         pending_item = item
         pending_before = before_totals
@@ -228,6 +296,9 @@ def run_quiz(driver) -> QuizRunResult:
 def format_quiz_summary(result: QuizRunResult, bank: Optional[QuestionBank] = None) -> str:
     bank = bank or QuestionBank()
     lines = [f"今日进度：{result.participated}/{result.total}"]
+    if result.skip_reason:
+        lines.append(f"已跳过：{result.skip_reason}")
+        lines.append("有空请手动打开论坛，重试未完成的题目。")
     if result.already_done and not result.items:
         lines.append("本次未新作答，题目此前已完成。")
     else:
@@ -237,11 +308,18 @@ def format_quiz_summary(result: QuizRunResult, bank: Optional[QuestionBank] = No
         if result.correct_rate is not None:
             lines.append(f"本次正确率：{result.correct_rate * 100:.2f}%")
         for item in result.items:
-            mark = "对" if item.correct else ("错" if item.correct is False else "?")
-            lines.append(
-                f"{item.index}. [{mark}] {item.question}\n"
-                f"   选择 {item.label} {item.choice_text}（来源：{item.source}）"
-            )
+            if item.skipped:
+                mark = "跳过"
+            elif item.correct is True:
+                mark = "对"
+            elif item.correct is False:
+                mark = "错"
+            else:
+                mark = "?"
+            title = item.question or "题目未加载"
+            choice = f"{item.label} {item.choice_text}".strip() if item.label else "未提交"
+            source = f"（来源：{item.source}）" if item.source else ""
+            lines.append(f"{item.index}. [{mark}] {title}\n   选择 {choice}{source}")
             if item.reason:
                 lines.append(f"   依据：{item.reason}")
     lines.extend(bank.summary_lines())
